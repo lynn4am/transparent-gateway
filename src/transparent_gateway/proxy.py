@@ -11,7 +11,8 @@ from transparent_gateway.circuit_breaker import CircuitBreakerManager
 from transparent_gateway.logging_config import get_logger, generate_request_id, request_id_var
 
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-              "te", "trailers", "transfer-encoding", "upgrade", "host"}
+              "te", "trailers", "transfer-encoding", "upgrade", "host",
+              "content-length", "content-encoding"}
 
 PROBE_PROBABILITY = 0.05  # 5% 概率探测熔断的供应商
 
