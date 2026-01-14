@@ -27,50 +27,37 @@ class Config:
 
 
 def load_config(config_path: str | None = None) -> Config:
-    """加载配置文件"""
     if config_path is None:
         config_path = os.getenv("CONFIG_PATH", "config.yaml")
 
     path = Path(config_path)
     if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+        raise FileNotFoundError(f"Config not found: {config_path}")
 
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
-    gateway = data.get("gateway", {})
-    providers_data = data.get("providers", [])
+    gw = data.get("gateway", {})
+    cb = gw.get("circuit_breaker", {})
 
-    if not providers_data:
-        raise ValueError("At least one provider is required")
-
-    # 解析供应商列表（支持新旧两种格式）
-    providers = []
-    for p in providers_data:
-        providers.append(Provider(
-            name=p["name"],
-            base_url=p["base_url"].rstrip("/"),
-            token=p.get("token") or p.get("auth_token", ""),
-        ))
-
-    # 解析熔断器配置（支持新旧两种格式）
-    cb_config = gateway.get("circuit_breaker", {})
-    circuit_breaker = CircuitBreakerConfig(
-        failure_threshold=cb_config.get("failure_threshold")
-            or gateway.get("circuit_breaker_threshold", 5),
-        reset_timeout=cb_config.get("reset_timeout")
-            or gateway.get("circuit_breaker_timeout", 600),
-    )
+    providers = [
+        Provider(p["name"], p["base_url"].rstrip("/"), p["token"])
+        for p in data.get("providers", [])
+    ]
+    if not providers:
+        raise ValueError("At least one provider required")
 
     return Config(
-        access_token=gateway.get("access_token", ""),
-        timeout=gateway.get("timeout") or gateway.get("request_timeout", 60.0),
-        circuit_breaker=circuit_breaker,
+        access_token=gw.get("access_token", ""),
+        timeout=gw.get("timeout", 60.0),
+        circuit_breaker=CircuitBreakerConfig(
+            failure_threshold=cb.get("failure_threshold", 5),
+            reset_timeout=cb.get("reset_timeout", 600),
+        ),
         providers=providers,
     )
 
 
-# 全局配置
 _config: Config | None = None
 
 
