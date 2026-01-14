@@ -1,179 +1,242 @@
 # Transparent Gateway
 
-透明 API 网关，支持多供应商故障转移和熔断机制。
+透明 API 网关，支持多供应商自动故障转移和熔断保护。
 
 ## 功能特性
 
-- **透明代理**：完整转发请求方法、请求头、请求体、查询参数
-- **多供应商支持**：按优先级配置多个 API 供应商
-- **自动故障转移**：主供应商失败时自动切换到备用供应商
-- **熔断机制**：供应商失败后自动熔断，避免重复请求失败的服务
-- **Token 替换**：自动将网关 token 替换为供应商 token
-- **Streaming 支持**：支持 SSE 流式响应转发
+- **透明代理** - 完整转发请求，客户端无感知
+- **自动故障转移** - 主供应商失败时自动切换到备用
+- **熔断保护** - 连续失败自动熔断，避免雪崩
+- **半开探测** - 自动尝试恢复已熔断的供应商
+- **保底机制** - 最后一个供应商永不熔断，确保可用性
+- **流式支持** - 完整支持 SSE 流式响应
 
 ## 快速开始
 
-### 安装
+### 1. 安装依赖
 
 ```bash
-# 使用 uv
 uv sync
-
-# 或使用 pip
-pip install -e .
 ```
 
-### 配置
+### 2. 创建配置
 
-创建 `config.yaml` 文件：
+复制示例配置并修改：
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+编辑 `config.yaml`：
 
 ```yaml
 gateway:
-  # 用户访问网关需要的 token
-  access_token: "your-gateway-access-token"
+  access_token: "your-gateway-token"  # 留空则跳过验证
+  timeout: 300
 
-  # 熔断时间（秒），默认 600 秒（10 分钟）
-  circuit_breaker_timeout: 600
+  circuit_breaker:
+    failure_threshold: 5    # 连续失败 5 次触发熔断
+    reset_timeout: 600      # 熔断 10 分钟后自动恢复
 
-  # 请求超时（秒）
-  request_timeout: 30
-
-# 供应商列表（按优先级排序，第一个优先）
 providers:
-  - name: "anthropic-primary"
+  - name: "primary"
     base_url: "https://api.anthropic.com"
-    auth_token: "sk-ant-api03-xxxxx"
+    token: "sk-ant-xxx"
 
-  - name: "anthropic-backup"
-    base_url: "https://api.backup-provider.com"
-    auth_token: "sk-backup-xxxxx"
+  - name: "backup"
+    base_url: "https://backup.example.com"
+    token: "sk-backup-xxx"
 ```
 
-### 启动
+### 3. 启动服务
 
 ```bash
-# 默认读取 config.yaml
+# 生产环境
 uvicorn transparent_gateway.main:app --host 0.0.0.0 --port 8000
 
-# 指定配置文件路径
-CONFIG_PATH=/path/to/config.yaml uvicorn transparent_gateway.main:app --host 0.0.0.0 --port 8000
+# 开发环境（热重载）
+uvicorn transparent_gateway.main:app --port 3001 --reload
 ```
 
-## 使用
+## 使用示例
 
-### 普通请求
+### 发送请求
 
 ```bash
 curl http://localhost:8000/v1/messages \
-  --header "x-api-key: your-gateway-access-token" \
-  --header "anthropic-version: 2023-06-01" \
-  --header "content-type: application/json" \
-  --data '{
+  -H "x-api-key: your-gateway-token" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{
     "model": "claude-sonnet-4-5",
     "max_tokens": 1024,
-    "messages": [
-      {"role": "user", "content": "Hello, Claude"}
-    ]
+    "messages": [{"role": "user", "content": "Hello"}]
   }'
 ```
 
-### Streaming 请求
+### 流式请求
 
 ```bash
 curl http://localhost:8000/v1/messages \
-  --header "x-api-key: your-gateway-access-token" \
-  --header "anthropic-version: 2023-06-01" \
-  --header "content-type: application/json" \
-  --data '{
+  -H "x-api-key: your-gateway-token" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{
     "model": "claude-sonnet-4-5",
     "max_tokens": 1024,
     "stream": true,
-    "messages": [
-      {"role": "user", "content": "Hello, Claude"}
-    ]
+    "messages": [{"role": "user", "content": "Hello"}]
   }'
 ```
 
-## 管理端点
-
-### 健康检查
+### 管理端点
 
 ```bash
+# 健康检查
 curl http://localhost:8000/_health
-```
 
-响应示例：
-
-```json
-{
-  "status": "ok",
-  "providers": ["anthropic-primary", "anthropic-backup"],
-  "circuit_breakers": {
-    "anthropic-primary": {
-      "is_open": false,
-      "remaining_time": null
-    }
-  }
-}
-```
-
-### 重置熔断器
-
-```bash
+# 重置所有熔断器
 curl -X POST http://localhost:8000/_reset_circuit
 ```
-
-## 工作原理
-
-```
-客户端请求
-    │
-    ▼
-┌─────────────────┐
-│  Token 验证     │ ──── 验证失败 ──→ 401 Unauthorized
-└─────────────────┘
-    │ 验证通过
-    ▼
-┌─────────────────┐
-│  检查供应商 A   │ ──── 已熔断 ──→ 跳过
-│  熔断状态       │
-└─────────────────┘
-    │ 未熔断
-    ▼
-┌─────────────────┐
-│  转发到供应商 A │ ──── 成功 ──→ 返回响应
-│  (替换 token)   │
-└─────────────────┘
-    │ 失败 (5xx/网络错误)
-    ▼
-┌─────────────────┐
-│  触发熔断       │
-│  (10 分钟)      │
-└─────────────────┘
-    │
-    ▼
-┌─────────────────┐
-│  转发到供应商 B │ ──→ 返回响应（成功或失败）
-└─────────────────┘
-```
-
-## 熔断规则
-
-- **触发条件**：5xx 响应或网络错误（超时、连接失败等）
-- **熔断时间**：默认 10 分钟，可通过 `circuit_breaker_timeout` 配置
-- **自动恢复**：熔断时间结束后自动尝试该供应商
-- **手动重置**：通过 `/_reset_circuit` 端点重置所有熔断器
 
 ## 配置说明
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
-| `gateway.access_token` | 网关访问 token，为空则跳过验证 | - |
-| `gateway.circuit_breaker_timeout` | 熔断时间（秒） | 600 |
-| `gateway.request_timeout` | 请求超时（秒） | 30 |
-| `providers[].name` | 供应商名称（用于标识） | - |
-| `providers[].base_url` | 供应商 API 基础 URL | - |
-| `providers[].auth_token` | 供应商 API token | - |
+| `gateway.access_token` | 网关访问令牌，留空跳过验证 | - |
+| `gateway.timeout` | 请求超时（秒） | 60 |
+| `gateway.circuit_breaker.failure_threshold` | 触发熔断的连续失败次数 | 5 |
+| `gateway.circuit_breaker.reset_timeout` | 熔断持续时间（秒） | 600 |
+| `providers[].name` | 供应商名称 | - |
+| `providers[].base_url` | 供应商 API 地址 | - |
+| `providers[].token` | 供应商 API 令牌 | - |
+
+---
+
+# 进阶内容
+
+## 工作原理
+
+### 请求流程
+
+```
+客户端请求
+    │
+    ├─ Token 验证 ────────────────── 失败 → 401
+    │
+    ├─ 选择供应商
+    │   ├─ 5% 概率：探测一个已熔断的供应商（半开状态）
+    │   └─ 其他：按优先级选择第一个未熔断的供应商
+    │
+    ├─ 转发请求（替换 token）
+    │
+    ├─ 处理响应
+    │   ├─ 成功（< 500）→ 重置失败计数，返回响应
+    │   └─ 失败（≥ 500 或网络错误）→ 记录失败，尝试下一个
+    │
+    └─ 全部失败 → 502 Bad Gateway
+```
+
+### 熔断策略
+
+| 特性 | 说明 |
+|------|------|
+| **触发条件** | 连续 N 次失败（5xx 或网络错误） |
+| **自动恢复** | 熔断超时后自动关闭熔断器 |
+| **半开探测** | 5% 请求会探测已熔断供应商，成功则恢复 |
+| **保底机制** | 最后一个供应商永不熔断，确保始终可用 |
+
+### 成功与失败判定
+
+- **成功**：HTTP 状态码 < 500
+- **失败**：HTTP 状态码 ≥ 500，或网络错误（超时、连接失败等）
+
+## 代码结构
+
+```
+src/transparent_gateway/
+├── main.py              # FastAPI 应用入口和路由定义
+├── config.py            # YAML 配置加载
+├── proxy.py             # 请求转发和故障转移逻辑
+├── circuit_breaker.py   # 熔断器实现
+└── logging_config.py    # 结构化 JSON 日志
+```
+
+### 核心模块说明
+
+#### main.py
+
+定义三个路由：
+- `/{path:path}` - 主代理路由，转发所有请求
+- `/_health` - 健康检查，返回供应商和熔断状态
+- `/_reset_circuit` - 手动重置所有熔断器
+
+#### config.py
+
+配置管理，支持：
+- 从 `config.yaml` 或 `CONFIG_PATH` 环境变量加载配置
+- 解析供应商列表和熔断器参数
+- 全局配置单例
+
+#### proxy.py
+
+核心转发逻辑：
+- `select_provider()` - 选择供应商（含半开探测逻辑）
+- `proxy_request()` - 主入口，区分普通/流式请求
+- `_try_provider()` - 转发到单个供应商
+- `check_auth()` - 验证网关令牌
+
+#### circuit_breaker.py
+
+熔断器实现：
+- `CircuitBreaker` - 单个供应商的熔断器
+- `CircuitBreakerManager` - 管理所有供应商的熔断器
+- 支持失败计数、熔断判定、超时恢复
+
+#### logging_config.py
+
+结构化日志：
+- JSON 格式输出到 `logs/gateway.log`
+- 日志轮转（10MB，保留 5 个备份）
+- 请求 ID 跟踪，便于问题排查
+
+## 日志分析
+
+日志位于 `logs/gateway.log`，JSON 格式。
+
+```bash
+# 追踪单个请求
+grep '"req_id":"abc123"' logs/gateway.log | jq .
+
+# 查看错误
+grep '"level":"ERROR"' logs/gateway.log | jq .
+
+# 熔断事件
+grep '"msg":"circuit_breaker"' logs/gateway.log | jq .
+
+# 最近 10 条日志
+tail -10 logs/gateway.log | jq .
+```
+
+### 日志字段
+
+| 字段 | 说明 |
+|------|------|
+| `ts` | 时间戳 |
+| `level` | 日志级别 |
+| `req_id` | 请求 ID（同一请求的所有日志共享） |
+| `msg` | 消息类型 |
+| `provider` | 供应商名称 |
+| `status` | HTTP 状态码 |
+| `duration_ms` | 耗时（毫秒） |
+| `error_type` | 错误类型 |
+| `error_msg` | 错误信息 |
+
+## 环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `CONFIG_PATH` | 配置文件路径，默认 `config.yaml` |
 
 ## License
 
