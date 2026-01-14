@@ -1,21 +1,32 @@
-# 透明网关配置
+# 透明网关配置示例
+# 复制此文件为 config.yaml 并填入实际值
 
 gateway:
-  # 用户访问网关需要的 token（网关会验证请求头中是否包含此 token）
-  access_token: "your-gateway-access-token"
-
-  # 熔断时间（秒），默认 600 秒（10 分钟）
-  circuit_breaker_timeout: 600
+  # 网关访问 token（客户端需要在请求头中包含此 token）
+  # 留空则跳过验证
+  access_token: "your-gateway-token"
 
   # 请求超时（秒）
-  request_timeout: 30
+  timeout: 60
 
-# 供应商列表（按优先级排序，第一个优先）
+  # 熔断器配置
+  circuit_breaker:
+    # 连续失败多少次后触发熔断
+    failure_threshold: 5
+    # 熔断持续时间（秒），之后自动恢复
+    reset_timeout: 600
+
+# 供应商列表（按优先级排序，第一个最优先）
+# 可以添加任意数量的供应商
 providers:
-  - name: "anthropic-primary"
+  - name: "primary"
     base_url: "https://api.anthropic.com"
-    auth_token: "sk-ant-api03-xxxxx"
+    token: "sk-ant-xxx"
 
-  - name: "anthropic-backup"
-    base_url: "https://api.backup-provider.com"
-    auth_token: "sk-backup-xxxxx"
+  - name: "backup-1"
+    base_url: "https://backup1.example.com"
+    token: "sk-backup1-xxx"
+
+  - name: "backup-2"
+    base_url: "https://backup2.example.com"
+    token: "sk-backup2-xxx"
