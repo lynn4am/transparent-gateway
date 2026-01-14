@@ -1,0 +1,21 @@
+# 透明网关配置
+
+gateway:
+  # 用户访问网关需要的 token（网关会验证请求头中是否包含此 token）
+  access_token: "your-gateway-access-token"
+
+  # 熔断时间（秒），默认 600 秒（10 分钟）
+  circuit_breaker_timeout: 600
+
+  # 请求超时（秒）
+  request_timeout: 30
+
+# 供应商列表（按优先级排序，第一个优先）
+providers:
+  - name: "anthropic-primary"
+    base_url: "https://api.anthropic.com"
+    auth_token: "sk-ant-api03-xxxxx"
+
+  - name: "anthropic-backup"
+    base_url: "https://api.backup-provider.com"
+    auth_token: "sk-backup-xxxxx"
