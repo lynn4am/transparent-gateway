@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local config (contains secrets)
+config.yaml
