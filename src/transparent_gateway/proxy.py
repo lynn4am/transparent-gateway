@@ -1,5 +1,5 @@
 import json
-import logging
+import time
 from collections.abc import AsyncIterator
 
 import httpx
@@ -8,8 +8,11 @@ from fastapi.responses import StreamingResponse
 
 from transparent_gateway.config import get_config, Provider
 from transparent_gateway.circuit_breaker import CircuitBreakerManager
-
-logger = logging.getLogger(__name__)
+from transparent_gateway.logging_config import (
+    get_logger,
+    generate_request_id,
+    request_id_var,
+)
 
 
 # 需要跳过的 hop-by-hop headers
@@ -131,14 +134,20 @@ async def proxy_request(request: Request) -> Response | StreamingResponse:
     """
     透明代理请求，实现故障转移和熔断机制，支持 streaming
     """
+    # 设置请求 ID
+    req_id = generate_request_id()
+    request_id_var.set(req_id)
+
     config = get_config()
     breaker_manager = get_breaker_manager()
+    logger = get_logger()
 
     # 获取原始 headers
     original_headers = dict(request.headers)
 
     # 验证 access_token
     if not verify_access_token(original_headers, config.access_token):
+        logger.warning("auth_failed", reason="invalid_access_token")
         return Response(
             content=b'{"error": "Unauthorized", "detail": "Invalid access token"}',
             status_code=401,
@@ -147,17 +156,25 @@ async def proxy_request(request: Request) -> Response | StreamingResponse:
 
     body = await request.body()
     is_streaming = is_stream_request(body)
-    last_error: Exception | None = None
-    last_response: httpx.Response | None = None
+    model = extract_model(body)
+
+    # 记录请求开始
+    logger.request_start(
+        method=request.method,
+        path=request.url.path,
+        query=request.url.query or None,
+        model=model,
+        stream=is_streaming,
+    )
 
     # 对于 streaming 请求，需要保持 client 存活
     if is_streaming:
         return await _handle_streaming_request(
-            request, body, original_headers, config, breaker_manager
+            request, body, original_headers, config, breaker_manager, model
         )
     else:
         return await _handle_normal_request(
-            request, body, original_headers, config, breaker_manager
+            request, body, original_headers, config, breaker_manager, model
         )
 
 
@@ -167,18 +184,28 @@ async def _handle_normal_request(
     original_headers: dict,
     config,
     breaker_manager: CircuitBreakerManager,
+    model: str | None,
 ) -> Response:
     """处理普通（非 streaming）请求"""
     last_error: Exception | None = None
     last_response: httpx.Response | None = None
-    model = extract_model(body)
+    logger = get_logger()
+    attempt = 0
 
     async with httpx.AsyncClient() as client:
         for provider in config.providers:
             breaker = breaker_manager.get(provider.name)
 
             if breaker.is_open():
+                logger.debug(
+                    "provider_skipped",
+                    provider=provider.name,
+                    reason="circuit_open",
+                )
                 continue
+
+            attempt += 1
+            start_time = time.time()
 
             try:
                 url = build_target_url(provider, request)
@@ -186,12 +213,10 @@ async def _handle_normal_request(
                     original_headers, config.access_token, provider.auth_token
                 )
 
-                logger.info(
-                    "Forwarding request: %s %s -> provider=%s, model=%s",
-                    request.method,
-                    url,
-                    provider.name,
-                    model,
+                logger.request_forward(
+                    provider=provider.name,
+                    target_url=url,
+                    attempt=attempt,
                 )
 
                 response = await client.request(
@@ -202,31 +227,58 @@ async def _handle_normal_request(
                     timeout=config.request_timeout,
                 )
 
+                duration_ms = (time.time() - start_time) * 1000
+
                 if not is_failure_response(response.status_code):
                     breaker.record_success()
+                    logger.request_success(
+                        provider=provider.name,
+                        status_code=response.status_code,
+                        duration_ms=duration_ms,
+                    )
                     return Response(
                         content=response.content,
                         status_code=response.status_code,
                         headers=filter_headers(dict(response.headers)),
                     )
 
-                logger.error(
-                    "Provider %s returned %s: %s",
-                    provider.name,
-                    response.status_code,
-                    response.content.decode(errors="replace")[:500],
-                )
+                # 5xx 错误
                 breaker.record_failure()
+                logger.request_failure(
+                    provider=provider.name,
+                    error_type="http_error",
+                    error_msg=response.content.decode(errors="replace"),
+                    status_code=response.status_code,
+                    duration_ms=duration_ms,
+                )
+
+                # 检查是否触发熔断
+                if breaker.is_open():
+                    logger.circuit_breaker_event(
+                        provider=provider.name,
+                        event="opened",
+                        failure_count=breaker.failure_count,
+                    )
+
                 last_response = response
 
             except httpx.RequestError as e:
-                logger.error(
-                    "Request to provider %s failed: %s: %s",
-                    provider.name,
-                    type(e).__name__,
-                    repr(e),
-                )
+                duration_ms = (time.time() - start_time) * 1000
                 breaker.record_failure()
+                logger.request_failure(
+                    provider=provider.name,
+                    error_type=type(e).__name__,
+                    error_msg=str(e),
+                    duration_ms=duration_ms,
+                )
+
+                if breaker.is_open():
+                    logger.circuit_breaker_event(
+                        provider=provider.name,
+                        event="opened",
+                        failure_count=breaker.failure_count,
+                    )
+
                 last_error = e
 
     if last_response is not None:
@@ -237,6 +289,7 @@ async def _handle_normal_request(
         )
 
     error_detail = str(last_error) if last_error else "All providers unavailable"
+    logger.error("all_providers_failed", error=error_detail)
     return Response(
         content=f'{{"error": "Bad Gateway", "detail": "{error_detail}"}}'.encode(),
         status_code=502,
@@ -250,28 +303,36 @@ async def _handle_streaming_request(
     original_headers: dict,
     config,
     breaker_manager: CircuitBreakerManager,
+    model: str | None,
 ) -> Response | StreamingResponse:
     """处理 streaming 请求"""
-    model = extract_model(body)
+    logger = get_logger()
+    attempt = 0
 
     # 找到第一个可用的 provider
     for provider in config.providers:
         breaker = breaker_manager.get(provider.name)
 
         if breaker.is_open():
+            logger.debug(
+                "provider_skipped",
+                provider=provider.name,
+                reason="circuit_open",
+            )
             continue
+
+        attempt += 1
+        start_time = time.time()
 
         url = build_target_url(provider, request)
         headers = prepare_headers(
             original_headers, config.access_token, provider.auth_token
         )
 
-        logger.info(
-            "Forwarding streaming request: %s %s -> provider=%s, model=%s",
-            request.method,
-            url,
-            provider.name,
-            model,
+        logger.request_forward(
+            provider=provider.name,
+            target_url=url,
+            attempt=attempt,
         )
 
         # 创建一个长连接 client 用于 streaming
@@ -289,21 +350,37 @@ async def _handle_streaming_request(
                 stream=True,
             )
 
+            duration_ms = (time.time() - start_time) * 1000
+
             if is_failure_response(response.status_code):
                 content = await response.aread()
-                logger.error(
-                    "Provider %s returned %s: %s",
-                    provider.name,
-                    response.status_code,
-                    content.decode(errors="replace")[:500],
-                )
                 await response.aclose()
                 await client.aclose()
+
                 breaker.record_failure()
+                logger.request_failure(
+                    provider=provider.name,
+                    error_type="http_error",
+                    error_msg=content.decode(errors="replace"),
+                    status_code=response.status_code,
+                    duration_ms=duration_ms,
+                )
+
+                if breaker.is_open():
+                    logger.circuit_breaker_event(
+                        provider=provider.name,
+                        event="opened",
+                        failure_count=breaker.failure_count,
+                    )
                 continue
 
             # 成功，记录并返回 streaming response
             breaker.record_success()
+            logger.request_success(
+                provider=provider.name,
+                status_code=response.status_code,
+                duration_ms=duration_ms,
+            )
 
             async def generate():
                 try:
@@ -320,17 +397,27 @@ async def _handle_streaming_request(
             )
 
         except httpx.RequestError as e:
-            logger.error(
-                "Request to provider %s failed: %s: %s",
-                provider.name,
-                type(e).__name__,
-                repr(e),
-            )
+            duration_ms = (time.time() - start_time) * 1000
             await client.aclose()
+
             breaker.record_failure()
+            logger.request_failure(
+                provider=provider.name,
+                error_type=type(e).__name__,
+                error_msg=str(e),
+                duration_ms=duration_ms,
+            )
+
+            if breaker.is_open():
+                logger.circuit_breaker_event(
+                    provider=provider.name,
+                    event="opened",
+                    failure_count=breaker.failure_count,
+                )
             continue
 
     # 所有 provider 都不可用
+    logger.error("all_providers_failed", error="All providers unavailable")
     return Response(
         content=b'{"error": "Bad Gateway", "detail": "All providers unavailable"}',
         status_code=502,
