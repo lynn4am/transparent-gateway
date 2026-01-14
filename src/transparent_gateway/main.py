@@ -1,7 +1,14 @@
+import logging
+
 from fastapi import FastAPI, Request
 
 from transparent_gateway.proxy import proxy_request, get_breaker_manager
 from transparent_gateway.config import get_config
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 
 app = FastAPI(title="Transparent Gateway")
 

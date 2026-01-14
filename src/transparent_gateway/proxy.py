@@ -1,4 +1,5 @@
 import json
+import logging
 from collections.abc import AsyncIterator
 
 import httpx
@@ -7,6 +8,8 @@ from fastapi.responses import StreamingResponse
 
 from transparent_gateway.config import get_config, Provider
 from transparent_gateway.circuit_breaker import CircuitBreakerManager
+
+logger = logging.getLogger(__name__)
 
 
 # 需要跳过的 hop-by-hop headers
@@ -30,7 +33,10 @@ def get_breaker_manager() -> CircuitBreakerManager:
     global _breaker_manager
     if _breaker_manager is None:
         config = get_config()
-        _breaker_manager = CircuitBreakerManager(config.circuit_breaker_timeout)
+        _breaker_manager = CircuitBreakerManager(
+            config.circuit_breaker_timeout,
+            config.circuit_breaker_threshold,
+        )
     return _breaker_manager
 
 
@@ -69,6 +75,15 @@ def is_stream_request(body: bytes) -> bool:
         return data.get("stream", False) is True
     except (json.JSONDecodeError, AttributeError):
         return False
+
+
+def extract_model(body: bytes) -> str | None:
+    """从请求体中提取模型名称"""
+    try:
+        data = json.loads(body)
+        return data.get("model")
+    except (json.JSONDecodeError, AttributeError):
+        return None
 
 
 def build_target_url(provider: Provider, request: Request) -> str:
@@ -156,6 +171,7 @@ async def _handle_normal_request(
     """处理普通（非 streaming）请求"""
     last_error: Exception | None = None
     last_response: httpx.Response | None = None
+    model = extract_model(body)
 
     async with httpx.AsyncClient() as client:
         for provider in config.providers:
@@ -170,6 +186,14 @@ async def _handle_normal_request(
                     original_headers, config.access_token, provider.auth_token
                 )
 
+                logger.info(
+                    "Forwarding request: %s %s -> provider=%s, model=%s",
+                    request.method,
+                    url,
+                    provider.name,
+                    model,
+                )
+
                 response = await client.request(
                     method=request.method,
                     url=url,
@@ -179,17 +203,30 @@ async def _handle_normal_request(
                 )
 
                 if not is_failure_response(response.status_code):
+                    breaker.record_success()
                     return Response(
                         content=response.content,
                         status_code=response.status_code,
                         headers=filter_headers(dict(response.headers)),
                     )
 
-                breaker.trip()
+                logger.error(
+                    "Provider %s returned %s: %s",
+                    provider.name,
+                    response.status_code,
+                    response.content.decode(errors="replace")[:500],
+                )
+                breaker.record_failure()
                 last_response = response
 
             except httpx.RequestError as e:
-                breaker.trip()
+                logger.error(
+                    "Request to provider %s failed: %s: %s",
+                    provider.name,
+                    type(e).__name__,
+                    repr(e),
+                )
+                breaker.record_failure()
                 last_error = e
 
     if last_response is not None:
@@ -215,6 +252,8 @@ async def _handle_streaming_request(
     breaker_manager: CircuitBreakerManager,
 ) -> Response | StreamingResponse:
     """处理 streaming 请求"""
+    model = extract_model(body)
+
     # 找到第一个可用的 provider
     for provider in config.providers:
         breaker = breaker_manager.get(provider.name)
@@ -227,8 +266,16 @@ async def _handle_streaming_request(
             original_headers, config.access_token, provider.auth_token
         )
 
+        logger.info(
+            "Forwarding streaming request: %s %s -> provider=%s, model=%s",
+            request.method,
+            url,
+            provider.name,
+            model,
+        )
+
         # 创建一个长连接 client 用于 streaming
-        client = httpx.AsyncClient()
+        client = httpx.AsyncClient(timeout=config.request_timeout)
 
         try:
             # 先发送请求获取响应头，检查是否成功
@@ -243,12 +290,21 @@ async def _handle_streaming_request(
             )
 
             if is_failure_response(response.status_code):
+                content = await response.aread()
+                logger.error(
+                    "Provider %s returned %s: %s",
+                    provider.name,
+                    response.status_code,
+                    content.decode(errors="replace")[:500],
+                )
                 await response.aclose()
                 await client.aclose()
-                breaker.trip()
+                breaker.record_failure()
                 continue
 
-            # 成功，返回 streaming response
+            # 成功，记录并返回 streaming response
+            breaker.record_success()
+
             async def generate():
                 try:
                     async for chunk in response.aiter_bytes():
@@ -263,9 +319,15 @@ async def _handle_streaming_request(
                 headers=filter_headers(dict(response.headers)),
             )
 
-        except httpx.RequestError:
+        except httpx.RequestError as e:
+            logger.error(
+                "Request to provider %s failed: %s: %s",
+                provider.name,
+                type(e).__name__,
+                repr(e),
+            )
             await client.aclose()
-            breaker.trip()
+            breaker.record_failure()
             continue
 
     # 所有 provider 都不可用

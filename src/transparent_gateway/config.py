@@ -16,6 +16,7 @@ class Provider:
 class GatewayConfig:
     access_token: str
     circuit_breaker_timeout: int
+    circuit_breaker_threshold: int
     request_timeout: float
     providers: list[Provider]
 
@@ -50,6 +51,7 @@ def load_config(config_path: str | None = None) -> GatewayConfig:
     return GatewayConfig(
         access_token=gateway.get("access_token", ""),
         circuit_breaker_timeout=gateway.get("circuit_breaker_timeout", 600),
+        circuit_breaker_threshold=gateway.get("circuit_breaker_threshold", 5),
         request_timeout=gateway.get("request_timeout", 30.0),
         providers=providers,
     )
