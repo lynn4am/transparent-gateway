@@ -61,10 +61,21 @@ grep '"msg":"circuit_breaker"' logs/gateway.log    # Breaker events
 ## Request Flow
 
 1. Auth check (token in any header value)
-2. For each provider (priority order):
-   - Skip if circuit open
-   - Forward request (replace gateway token → provider token)
-   - Success (< 500): return response
-   - Failure (≥ 500 or network error): record failure, try next
-   - N consecutive failures → circuit opens
-3. All failed → 502 Bad Gateway
+2. Select provider:
+   - 5% chance: probe a random tripped provider (half-open)
+   - Otherwise: first non-tripped provider in priority order
+   - Last provider never trips (always available as fallback)
+3. Forward request (replace gateway token → provider token)
+4. Success (< 500): record success (resets failure count), return response
+5. Failure (≥ 500 or network error): record failure, try next provider
+   - N consecutive failures → circuit opens (except last provider)
+6. All failed → 502 Bad Gateway
+
+## Circuit Breaker Strategy
+
+- **Threshold**: N consecutive failures trips the circuit (configurable)
+- **Auto-reset**: After reset_timeout seconds, circuit closes automatically
+- **Fallback guarantee**: Last provider never trips, always available
+- **Half-open probe**: 5% of requests probe a random tripped provider
+  - Probe success → circuit closes, provider recovers
+  - Probe failure → continue with next available provider

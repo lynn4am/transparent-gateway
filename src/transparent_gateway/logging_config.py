@@ -91,6 +91,7 @@ class GatewayLogger:
         provider: str,
         target_url: str,
         attempt: int = 1,
+        probe: bool = False,
     ) -> None:
         """记录请求转发"""
         self.info(
@@ -98,6 +99,7 @@ class GatewayLogger:
             provider=provider,
             target_url=target_url,
             attempt=attempt,
+            probe=probe,
         )
 
     def request_success(
