@@ -1,6 +1,7 @@
 import json
 import logging
 import sys
+import threading
 import uuid
 from contextvars import ContextVar
 from datetime import datetime
@@ -139,11 +140,11 @@ class GatewayLogger:
     def circuit_breaker_event(
         self,
         provider: str,
-        event: str,  # "opened", "closed", "half_open"
+        action: str,  # "opened", "closed", "half_open"
         failure_count: int | None = None,
     ) -> None:
         """记录熔断器事件"""
-        fields: dict[str, Any] = {"provider": provider, "event": event}
+        fields: dict[str, Any] = {"provider": provider, "action": action}
         if failure_count is not None:
             fields["failure_count"] = failure_count
         self.warning("circuit_breaker", **fields)
@@ -202,11 +203,28 @@ def setup_logging(
 
 # 全局日志实例
 _gateway_logger: GatewayLogger | None = None
+_gateway_logger_lock = threading.Lock()
 
 
 def get_logger() -> GatewayLogger:
-    """获取全局日志实例"""
+    """获取全局日志实例（线程安全的单例）"""
     global _gateway_logger
     if _gateway_logger is None:
-        _gateway_logger = setup_logging()
+        with _gateway_logger_lock:
+            if _gateway_logger is None:
+                _gateway_logger = setup_logging()
     return _gateway_logger
+
+
+def reset_logger() -> None:
+    """重置全局日志实例（仅用于测试）"""
+    global _gateway_logger
+    with _gateway_logger_lock:
+        _gateway_logger = None
+
+
+def set_logger(logger: GatewayLogger) -> None:
+    """设置全局日志实例（仅用于测试）"""
+    global _gateway_logger
+    with _gateway_logger_lock:
+        _gateway_logger = logger

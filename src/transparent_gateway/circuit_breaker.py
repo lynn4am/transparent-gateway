@@ -1,12 +1,21 @@
 import time
+from typing import Callable
 
 
 class CircuitBreaker:
     """熔断器实现，支持连续失败阈值"""
 
-    def __init__(self, timeout: int, failure_threshold: int = 5):
+    def __init__(
+        self,
+        timeout: int,
+        failure_threshold: int = 5,
+        on_auto_reset: Callable[[str], None] | None = None,
+        name: str = "",
+    ):
         self.timeout = timeout
         self.failure_threshold = failure_threshold
+        self._on_auto_reset = on_auto_reset
+        self._name = name
         self._tripped_at: float | None = None
         self._failure_count: int = 0
 
@@ -19,6 +28,8 @@ class CircuitBreaker:
             # 熔断时间已过，自动恢复
             self._tripped_at = None
             self._failure_count = 0
+            if self._on_auto_reset:
+                self._on_auto_reset(self._name)
             return False
         return True
 
@@ -57,16 +68,25 @@ class CircuitBreaker:
 class CircuitBreakerManager:
     """管理多个供应商的熔断器"""
 
-    def __init__(self, timeout: int, failure_threshold: int = 5):
+    def __init__(
+        self,
+        timeout: int,
+        failure_threshold: int = 5,
+        on_auto_reset: Callable[[str], None] | None = None,
+    ):
         self.timeout = timeout
         self.failure_threshold = failure_threshold
+        self._on_auto_reset = on_auto_reset
         self._breakers: dict[str, CircuitBreaker] = {}
 
     def get(self, provider_name: str) -> CircuitBreaker:
         """获取指定供应商的熔断器"""
         if provider_name not in self._breakers:
             self._breakers[provider_name] = CircuitBreaker(
-                self.timeout, self.failure_threshold
+                self.timeout,
+                self.failure_threshold,
+                self._on_auto_reset,
+                provider_name,
             )
         return self._breakers[provider_name]
 

@@ -10,12 +10,6 @@ setup_logging()
 app = FastAPI(title="Transparent Gateway")
 
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
-async def gateway(request: Request):
-    """透明代理所有请求"""
-    return await proxy_request(request)
-
-
 @app.get("/_health")
 async def health():
     """健康检查端点"""
@@ -34,3 +28,9 @@ async def reset_circuit():
     breaker_manager = get_breaker_manager()
     breaker_manager.reset_all()
     return {"status": "all circuit breakers reset"}
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
+async def gateway(request: Request):
+    """透明代理所有请求"""
+    return await proxy_request(request)

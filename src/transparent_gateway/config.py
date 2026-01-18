@@ -1,4 +1,5 @@
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +17,7 @@ class Provider:
 class CircuitBreakerConfig:
     failure_threshold: int = 5
     reset_timeout: int = 600
+    probe_probability: float = 0.05
 
 
 @dataclass
@@ -53,16 +55,35 @@ def load_config(config_path: str | None = None) -> Config:
         circuit_breaker=CircuitBreakerConfig(
             failure_threshold=cb.get("failure_threshold", 5),
             reset_timeout=cb.get("reset_timeout", 600),
+            probe_probability=cb.get("probe_probability", 0.05),
         ),
         providers=providers,
     )
 
 
 _config: Config | None = None
+_config_lock = threading.Lock()
 
 
 def get_config() -> Config:
+    """获取全局配置（线程安全的单例）"""
     global _config
     if _config is None:
-        _config = load_config()
+        with _config_lock:
+            if _config is None:
+                _config = load_config()
     return _config
+
+
+def reset_config() -> None:
+    """重置全局配置（仅用于测试）"""
+    global _config
+    with _config_lock:
+        _config = None
+
+
+def set_config(config: Config) -> None:
+    """设置全局配置（仅用于测试）"""
+    global _config
+    with _config_lock:
+        _config = config

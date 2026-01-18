@@ -1,33 +1,57 @@
 import json
 import random
+import threading
 import time
 
 import httpx
 from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
 
-from transparent_gateway.config import get_config
-from transparent_gateway.circuit_breaker import CircuitBreakerManager
-from transparent_gateway.logging_config import get_logger, generate_request_id, request_id_var
+from transparent_gateway.circuit_breaker import CircuitBreaker, CircuitBreakerManager
+from transparent_gateway.config import Config, Provider, get_config
+from transparent_gateway.logging_config import GatewayLogger, generate_request_id, get_logger, request_id_var
 
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
               "te", "trailers", "transfer-encoding", "upgrade", "host",
               "content-length", "content-encoding"}
 
-PROBE_PROBABILITY = 0.05  # 5% 概率探测熔断的供应商
-
 _breaker_manager: CircuitBreakerManager | None = None
+_breaker_manager_lock = threading.Lock()
+
+
+def _log_circuit_auto_reset(provider_name: str) -> None:
+    """熔断器自动恢复时的日志回调"""
+    logger = get_logger()
+    logger.circuit_breaker_event(provider_name, "auto_reset")
 
 
 def get_breaker_manager() -> CircuitBreakerManager:
+    """获取熔断器管理器（线程安全的单例）"""
     global _breaker_manager
     if _breaker_manager is None:
-        config = get_config()
-        _breaker_manager = CircuitBreakerManager(
-            config.circuit_breaker.reset_timeout,
-            config.circuit_breaker.failure_threshold,
-        )
+        with _breaker_manager_lock:
+            if _breaker_manager is None:
+                config = get_config()
+                _breaker_manager = CircuitBreakerManager(
+                    config.circuit_breaker.reset_timeout,
+                    config.circuit_breaker.failure_threshold,
+                    on_auto_reset=_log_circuit_auto_reset,
+                )
     return _breaker_manager
+
+
+def reset_breaker_manager() -> None:
+    """重置熔断器管理器（仅用于测试）"""
+    global _breaker_manager
+    with _breaker_manager_lock:
+        _breaker_manager = None
+
+
+def set_breaker_manager(manager: CircuitBreakerManager) -> None:
+    """设置熔断器管理器（仅用于测试）"""
+    global _breaker_manager
+    with _breaker_manager_lock:
+        _breaker_manager = manager
 
 
 def filter_headers(headers: dict) -> dict:
@@ -47,22 +71,40 @@ def check_auth(headers: dict, token: str) -> bool:
 
 
 def parse_body(body: bytes) -> tuple[str | None, bool]:
+    """解析请求体以提取 model 和 stream 字段
+
+    返回 (model, is_stream) 元组。解析失败时返回 (None, False)。
+    """
+    if not body:
+        return None, False
     try:
         data = json.loads(body)
-        return data.get("model"), data.get("stream", False) is True
-    except:
+        if not isinstance(data, dict):
+            return None, False
+        model = data.get("model")
+        stream = data.get("stream", False)
+        return model, stream is True
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return None, False
 
 
-def select_provider(providers, breaker_mgr, logger):
-    """
-    选择供应商，策略：
-    1. 5% 概率探测一个熔断的供应商（半开）
+def select_provider(
+    providers: list[Provider],
+    breaker_mgr: CircuitBreakerManager,
+    logger: GatewayLogger,
+    probe_probability: float = 0.05,
+) -> tuple[int, Provider, bool]:
+    """选择供应商
+
+    策略：
+    1. probe_probability 概率探测一个熔断的供应商（半开）
     2. 按顺序选择第一个未熔断的供应商
     3. 最后一个供应商永不熔断（保底）
+
+    返回 (索引, 供应商, 是否为探测)
     """
-    # 5% 概率探测熔断的供应商
-    if random.random() < PROBE_PROBABILITY:
+    # 按概率探测熔断的供应商
+    if random.random() < probe_probability:
         open_providers = [
             (i, p) for i, p in enumerate(providers[:-1])  # 排除最后一个
             if breaker_mgr.get(p.name).is_open()
@@ -83,6 +125,33 @@ def select_provider(providers, breaker_mgr, logger):
 
     # 不应该到这里，因为最后一个永不熔断
     return len(providers) - 1, providers[-1], False
+
+
+def _classify_error(exc: httpx.RequestError) -> str:
+    """对 httpx 错误进行分类"""
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.ConnectError):
+        return "connection_error"
+    return "request_error"
+
+
+def _handle_provider_failure(
+    breaker: CircuitBreaker,
+    provider_name: str,
+    is_last: bool,
+    logger: GatewayLogger,
+    error_type: str,
+    error_msg: str,
+    status_code: int | None = None,
+    duration_ms: float | None = None,
+) -> None:
+    """统一的供应商故障处理逻辑"""
+    if not is_last:
+        breaker.record_failure()
+        if breaker.is_open():
+            logger.circuit_breaker_event(provider_name, "opened", breaker.failure_count)
+    logger.request_failure(provider_name, error_type, error_msg, status_code, duration_ms)
 
 
 async def proxy_request(request: Request) -> Response | StreamingResponse:
@@ -113,7 +182,17 @@ async def proxy_request(request: Request) -> Response | StreamingResponse:
     return await _normal_request(request, headers, body, config, breaker_mgr)
 
 
-async def _try_provider(client, request, headers, body, config, provider, breaker_mgr, logger, is_probe):
+async def _try_provider(
+    client: httpx.AsyncClient,
+    request: Request,
+    headers: dict[str, str],
+    body: bytes,
+    config: Config,
+    provider: Provider,
+    breaker_mgr: CircuitBreakerManager,
+    logger: GatewayLogger,
+    is_probe: bool,
+) -> tuple[Response | None, bool]:
     """尝试一个供应商，返回 (Response, success)"""
     breaker = breaker_mgr.get(provider.name)
     is_last = provider == config.providers[-1]
@@ -142,35 +221,40 @@ async def _try_provider(client, request, headers, body, config, provider, breake
                           headers=filter_headers(dict(resp.headers))), True
 
         # 5xx 错误
-        if not is_last:  # 最后一个供应商不记录失败（不熔断）
-            breaker.record_failure()
-            if breaker.is_open():
-                logger.circuit_breaker_event(provider.name, "opened", breaker.failure_count)
-
-        logger.request_failure(provider.name, "http_error",
-                             resp.content.decode(errors="replace")[:200],
-                             resp.status_code, duration)
+        _handle_provider_failure(
+            breaker, provider.name, is_last, logger,
+            "http_error", resp.content.decode(errors="replace")[:200],
+            resp.status_code, duration
+        )
         return Response(resp.content, resp.status_code,
                        headers=filter_headers(dict(resp.headers))), False
 
     except httpx.RequestError as e:
         duration = (time.time() - start) * 1000
-        if not is_last:
-            breaker.record_failure()
-            if breaker.is_open():
-                logger.circuit_breaker_event(provider.name, "opened", breaker.failure_count)
-        logger.request_failure(provider.name, type(e).__name__, str(e), duration_ms=duration)
+        _handle_provider_failure(
+            breaker, provider.name, is_last, logger,
+            _classify_error(e), str(e), duration_ms=duration
+        )
         return None, False
 
 
-async def _normal_request(request, headers, body, config, breaker_mgr) -> Response:
+async def _normal_request(
+    request: Request,
+    headers: dict[str, str],
+    body: bytes,
+    config: Config,
+    breaker_mgr: CircuitBreakerManager,
+) -> Response:
+    """处理普通（非流式）请求"""
     logger = get_logger()
     providers = config.providers
     last_resp = None
 
     async with httpx.AsyncClient() as client:
         # 先尝试选择的供应商（可能是探测）
-        idx, provider, is_probe = select_provider(providers, breaker_mgr, logger)
+        idx, provider, is_probe = select_provider(
+            providers, breaker_mgr, logger, config.circuit_breaker.probe_probability
+        )
         resp, ok = await _try_provider(client, request, headers, body, config,
                                         provider, breaker_mgr, logger, is_probe)
         if ok:
@@ -204,12 +288,21 @@ async def _normal_request(request, headers, body, config, breaker_mgr) -> Respon
     return Response(b'{"error":"Bad Gateway"}', 502, media_type="application/json")
 
 
-async def _stream_request(request, headers, body, config, breaker_mgr) -> Response | StreamingResponse:
+async def _stream_request(
+    request: Request,
+    headers: dict[str, str],
+    body: bytes,
+    config: Config,
+    breaker_mgr: CircuitBreakerManager,
+) -> Response | StreamingResponse:
+    """处理流式请求"""
     logger = get_logger()
     providers = config.providers
 
     # 选择供应商
-    idx, provider, is_probe = select_provider(providers, breaker_mgr, logger)
+    idx, provider, is_probe = select_provider(
+        providers, breaker_mgr, logger, config.circuit_breaker.probe_probability
+    )
 
     # 构建尝试顺序：先选中的，再其他的
     attempt_order = [(idx, provider, is_probe)]
@@ -245,14 +338,11 @@ async def _stream_request(request, headers, body, config, breaker_mgr) -> Respon
                 await resp.aclose()
                 await client.aclose()
 
-                if not is_last:
-                    breaker.record_failure()
-                    if breaker.is_open():
-                        logger.circuit_breaker_event(provider.name, "opened", breaker.failure_count)
-
-                logger.request_failure(provider.name, "http_error",
-                                      content.decode(errors="replace")[:200],
-                                      resp.status_code, duration)
+                _handle_provider_failure(
+                    breaker, provider.name, is_last, logger,
+                    "http_error", content.decode(errors="replace")[:200],
+                    resp.status_code, duration
+                )
                 continue
 
             breaker.record_success()
@@ -275,12 +365,10 @@ async def _stream_request(request, headers, body, config, breaker_mgr) -> Respon
             duration = (time.time() - start) * 1000
             await client.aclose()
 
-            if not is_last:
-                breaker.record_failure()
-                if breaker.is_open():
-                    logger.circuit_breaker_event(provider.name, "opened", breaker.failure_count)
-
-            logger.request_failure(provider.name, type(e).__name__, str(e), duration_ms=duration)
+            _handle_provider_failure(
+                breaker, provider.name, is_last, logger,
+                _classify_error(e), str(e), duration_ms=duration
+            )
 
     logger.error("all_providers_failed", error="unavailable")
     return Response(b'{"error":"Bad Gateway"}', 502, media_type="application/json")
