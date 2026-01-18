@@ -107,6 +107,7 @@ curl -X POST http://localhost:8000/_reset_circuit
 | `gateway.timeout` | 请求超时（秒） | 60 |
 | `gateway.circuit_breaker.failure_threshold` | 触发熔断的连续失败次数 | 5 |
 | `gateway.circuit_breaker.reset_timeout` | 熔断持续时间（秒） | 600 |
+| `gateway.circuit_breaker.probe_probability` | 探测已熔断供应商的概率 | 0.05 |
 | `providers[].name` | 供应商名称 | - |
 | `providers[].base_url` | 供应商 API 地址 | - |
 | `providers[].token` | 供应商 API 令牌 | - |
@@ -143,7 +144,7 @@ curl -X POST http://localhost:8000/_reset_circuit
 |------|------|
 | **触发条件** | 连续 N 次失败（5xx 或网络错误） |
 | **自动恢复** | 熔断超时后自动关闭熔断器 |
-| **半开探测** | 5% 请求会探测已熔断供应商，成功则恢复 |
+| **半开探测** | 按配置概率探测已熔断供应商，成功则恢复（默认 5%） |
 | **保底机制** | 最后一个供应商永不熔断，确保始终可用 |
 
 ### 成功与失败判定
@@ -237,6 +238,24 @@ tail -10 logs/gateway.log | jq .
 | 变量 | 说明 |
 |------|------|
 | `CONFIG_PATH` | 配置文件路径，默认 `config.yaml` |
+
+## 开发
+
+### 安装开发依赖
+
+```bash
+uv sync --extra dev
+```
+
+### 运行测试
+
+```bash
+# 运行所有测试
+uv run pytest tests/ -v
+
+# 带覆盖率报告
+uv run pytest --cov=transparent_gateway tests/
+```
 
 ## License
 
